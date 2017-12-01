@@ -25,6 +25,8 @@ from autopush.db import (  # noqa
     has_connected_this_month,
     hasher,
     generate_last_connect,
+    Message,
+    BotoResources,
 )
 
 from autopush.config import AutopushConfig  # noqa
@@ -459,10 +461,11 @@ class CheckStorageCommand(ProcessorCommand):
     def _check_storage(self, command):
         timestamp = None
         messages = []
-        message = self.db.message_tables[command.message_month]
+        message = Message(command.message_month,
+                          resource_pool=self.db.resources)
         if command.include_topic:
             timestamp, messages = message.fetch_messages(
-                uaid=command.uaid, limit=11,
+                uaid=command.uaid, limit=11
             )
 
             # If we have topic messages, return them immediately
@@ -488,7 +491,8 @@ class CheckStorageCommand(ProcessorCommand):
 class IncrementStorageCommand(ProcessorCommand):
     def process(self, command):
         # type: (IncStoragePosition) -> IncStoragePositionResponse
-        message = self.db.message_tables[command.message_month]
+        message = Message(command.message_month,
+                          resource_pool=self.db.resources)
         message.update_last_message_read(command.uaid, command.timestamp)
         return IncStoragePositionResponse()
 
@@ -497,7 +501,8 @@ class DeleteMessageCommand(ProcessorCommand):
     def process(self, command):
         # type: (DeleteMessage) -> DeleteMessageResponse
         notif = command.message.to_WebPushNotification()
-        message = self.db.message_tables[command.message_month]
+        message = Message(command.message_month,
+                          resource_pool=self.db.resources)
         message.delete_message(notif)
         return DeleteMessageResponse()
 
@@ -513,25 +518,30 @@ class MigrateUserCommand(ProcessorCommand):
     def process(self, command):
         # type: (MigrateUser) -> MigrateUserResponse
         # Get the current channels for this month
-        message = self.db.message_tables[command.message_month]
+        message = Message(command.message_month,
+                          resource_pool=self.db.resources)
         _, channels = message.all_channels(command.uaid.hex)
 
         # Get the current message month
         cur_month = self.db.current_msg_month
         if channels:
             # Save the current channels into this months message table
-            msg_table = self.db.message_tables[cur_month]
-            msg_table.save_channels(command.uaid.hex, channels)
+            msg_table = Message(cur_month,
+                                resource_pool=self.db.resources)
+            msg_table.save_channels(command.uaid.hex,
+                                    channels)
 
         # Finally, update the route message month
-        self.db.router.update_message_month(command.uaid.hex, cur_month)
+        self.db.router.update_message_month(command.uaid.hex,
+                                            cur_month)
         return MigrateUserResponse(message_month=cur_month)
 
 
 class StoreMessagesUserCommand(ProcessorCommand):
     def process(self, command):
         # type: (StoreMessages) -> StoreMessagesResponse
-        message = self.db.message_tables[command.message_month]
+        message = Message(command.message_month,
+                          resource_pool=self.db.resources)
         for m in command.messages:
             if "topic" not in m:
                 m["topic"] = None
@@ -585,15 +595,15 @@ class RegisterCommand(ProcessorCommand):
             command.channel_id,
             command.key
         )
-        message = self.db.message_tables[command.message_month]
+        message = self.db.message_table(command.message_month)
         try:
-            message.register_channel(command.uaid.hex, command.channel_id)
+            message.register_channel(command.uaid.hex,
+                                     command.channel_id)
         except ClientError as ex:
             if (ex.response['Error']['Code'] ==
                     "ProvisionedThroughputExceededException"):
                 return RegisterErrorResponse(error_msg="overloaded",
                                              status=503)
-
         self.metrics.increment('ua.command.register')
         log.info(
             "Register",
@@ -634,12 +644,12 @@ class UnregisterCommand(ProcessorCommand):
         if not valid:
             return UnregisterErrorResponse(error_msg=msg)
 
-        message = self.db.message_tables[command.message_month]
+        message = Message(command.message_month,
+                          resource_pool=self.db.resources)
         # TODO: JSONResponseError not handled (no force_retry)
         message.unregister_channel(command.uaid.hex, command.channel_id)
 
-        # TODO: Clear out any existing tracked messages for this
-        # channel
+        # TODO: Clear out any existing tracked messages for this channel
 
         self.metrics.increment('ua.command.unregister')
         # TODO: user/raw_agent?

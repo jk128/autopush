@@ -4,12 +4,10 @@ import signal
 import subprocess
 
 import boto
-import botocore
-import boto3
 import psutil
+from twisted.internet import reactor
 
-import autopush.db
-from autopush.db import create_rotating_message_table
+from autopush.db import create_rotating_message_table, BotoResources
 
 here_dir = os.path.abspath(os.path.dirname(__file__))
 root_dir = os.path.dirname(os.path.dirname(here_dir))
@@ -17,35 +15,35 @@ ddb_dir = os.path.join(root_dir, "ddb")
 ddb_lib_dir = os.path.join(ddb_dir, "DynamoDBLocal_lib")
 ddb_jar = os.path.join(ddb_dir, "DynamoDBLocal.jar")
 ddb_process = None
+boto_resources = None
 
 
 def setUp():
     for name in ('boto', 'boto3', 'botocore'):
         logging.getLogger(name).setLevel(logging.CRITICAL)
-    global ddb_process
+    global ddb_process, boto_resources
     cmd = " ".join([
         "java", "-Djava.library.path=%s" % ddb_lib_dir,
         "-jar", ddb_jar, "-sharedDb", "-inMemory"
     ])
-    conf = botocore.config.Config(
-        region_name=os.getenv('AWS_REGION_NAME', 'us-east-1')
-    )
     ddb_process = subprocess.Popen(cmd, shell=True, env=os.environ)
-    autopush.db.g_dynamodb = boto3.resource(
-        'dynamodb',
-        config=conf,
-        endpoint_url=os.getenv("AWS_LOCAL_DYNAMODB", "http://127.0.0.1:8000"),
+    if os.getenv("AWS_LOCAL_DYNAMODB") is None:
+        os.environ["AWS_LOCAL_DYNAMODB"] = "http://127.0.0.1:8000"
+    ddb_session_args = dict(
+        endpoint_url=os.getenv("AWS_LOCAL_DYNAMODB"),
         aws_access_key_id="BogusKey",
         aws_secret_access_key="BogusKey",
     )
-
-    autopush.db.g_client = autopush.db.g_dynamodb.meta.client
-
+    boto_resources = BotoResources(conf=ddb_session_args)
     # Setup the necessary message tables
     message_table = os.environ.get("MESSAGE_TABLE", "message_int_test")
-
-    create_rotating_message_table(prefix=message_table, delta=-1)
-    create_rotating_message_table(prefix=message_table)
+    with boto_resources as resource:
+        create_rotating_message_table(prefix=message_table, delta=-1,
+                                      boto_resource=resource)
+        create_rotating_message_table(prefix=message_table,
+                                      boto_resource=resource)
+    pool = reactor.getThreadPool()
+    pool.adjustPoolsize(minthreads=pool.max)
 
 
 def tearDown():

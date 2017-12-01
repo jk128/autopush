@@ -149,7 +149,8 @@ class WebPushSubscriptionSchema(Schema):
             db.router.drop_user(uaid)
             raise InvalidRequest("No such subscription", status_code=410,
                                  errno=106)
-        exists, chans = db.message_tables[month_table].all_channels(uaid=uaid)
+        msg = db.message_table(month_table)
+        exists, chans = msg.all_channels(uaid=uaid)
 
         if (not exists or channel_id.lower() not
                 in map(lambda x: normalize_id(x), chans)):

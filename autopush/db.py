@@ -34,6 +34,7 @@ from __future__ import absolute_import
 import datetime
 import os
 import random
+import threading
 import time
 import uuid
 from functools import wraps
@@ -42,14 +43,16 @@ from attr import (
     asdict,
     attrs,
     attrib,
-    Factory
-)
+    Factory,
+    Attribute)
 
 from boto.dynamodb2.exceptions import (
     ItemNotFound,
 )
 import boto3
 import botocore
+from boto.dynamodb2.table import Table  # noqa
+from boto3.resources.base import ServiceResource  # noqa
 from boto3.dynamodb.conditions import Key
 from boto3.exceptions import Boto3Error
 from botocore.exceptions import ClientError
@@ -73,6 +76,7 @@ from twisted.internet.defer import inlineCallbacks, returnValue
 from twisted.internet.threads import deferToThread
 
 import autopush.metrics
+from autopush import constants
 from autopush.exceptions import AutopushException
 from autopush.metrics import IMetrics  # noqa
 from autopush.types import ItemLike  # noqa
@@ -96,16 +100,58 @@ key_hash = ""
 TRACK_DB_CALLS = False
 DB_CALLS = []
 
-# See https://botocore.readthedocs.io/en/stable/reference/config.html for
-# additional config options
-g_dynamodb = boto3.resource(
-    'dynamodb',
-    config=botocore.config.Config(
-        region_name=os.getenv("AWS_REGION_NAME", "us-east-1")
-    ),
-    endpoint_url=os.getenv("AWS_LOCAL_DYNAMODB")
-)
-g_client = g_dynamodb.meta.client
+DDB_SESSION_ARGS = {}
+MAX_DDB_SESSIONS = constants.THREAD_POOL_SIZE
+
+
+class BotoResources(object):
+    """A pool of boto3 Resources.
+
+    Boto3 resources are NOT thread safe.
+
+    """
+    def __init__(self, conf=None):
+        if conf is None:
+            conf = DDB_SESSION_ARGS  # pragma: nocover
+        if not conf.get("endpoint_url") and os.getenv("AWS_LOCAL_DYNAMODB"):
+            conf["endpoint_url"] = os.getenv("AWS_LOCAL_DYNAMODB")
+        if "endpoint_url" in conf and not conf["endpoint_url"]:
+            # If there's no endpoint URL value, we must delete the data
+            # entirely
+            del(conf["endpoint_url"])
+        self.conf = conf
+        self.ddb_data = threading.local()
+
+    def __enter__(self):
+        self._resource = self.fetch()
+        return self._resource
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release(self._resource)
+
+    def fetch(self):
+        """Return a boto resource. This MUST be released after use."""
+        # 7m.43s
+        # type: () -> ServiceResource
+        try:
+            return self.ddb_data.resource
+        except AttributeError:
+            self.ddb_data.resource = boto3.session.Session().resource(
+                'dynamodb',
+                config=botocore.config.Config(
+                    region_name=os.getenv("AWS_REGION_NAME", "us-east-1")
+                ),
+                **self.conf
+                )
+            return self.ddb_data.resource
+
+    def release(self, resource):
+        """Return a boto3 resource to the pool. """
+        # type: (ServiceResource) -> None
+        try:
+            del self.ddb_data.resource
+        except AttributeError:
+            pass
 
 
 def get_month(delta=0):
@@ -147,20 +193,20 @@ def make_rotating_tablename(prefix, delta=0, date=None):
 
 def create_rotating_message_table(prefix="message", delta=0, date=None,
                                   read_throughput=5,
-                                  write_throughput=5):
-    # type: (str, int, Optional[datetime.date], int, int) -> Table
+                                  write_throughput=5,
+                                  boto_resource=None):
+    # type: (str, int, Optional[datetime.date], int, int, ServiceResource) -> Table  # noqa
     """Create a new message table for webpush style message storage"""
     tablename = make_rotating_tablename(prefix, delta, date)
 
     try:
-        table = g_dynamodb.Table(tablename)
+        table = boto_resource.Table(tablename)
         if table.table_status == 'ACTIVE':  # pragma nocover
             return table
     except ClientError as ex:
         if ex.response['Error']['Code'] != 'ResourceNotFoundException':
-            # If we hit this, our boto3 is misconfigured and we need to bail.
-            raise ex  # pragma nocover
-    table = g_dynamodb.create_table(
+            pass
+    table = boto_resource.create_table(
         TableName=tablename,
         KeySchema=[
             {
@@ -201,24 +247,28 @@ def create_rotating_message_table(prefix="message", delta=0, date=None,
     return table
 
 
-def get_rotating_message_table(prefix="message", delta=0, date=None,
-                               message_read_throughput=5,
-                               message_write_throughput=5):
-    # type: (str, int, Optional[datetime.date], int, int) -> Table
+def get_rotating_message_tablename(prefix="message", delta=0, date=None,
+                                   message_read_throughput=5,
+                                   message_write_throughput=5,
+                                   boto_resource=None):
+    # type: (str, int, Optional[datetime.date], int, int, ServiceResource) -> str  # noqa
     """Gets the message table for the current month."""
     tablename = make_rotating_tablename(prefix, delta, date)
-    if not table_exists(tablename):
-        return create_rotating_message_table(
+    if not table_exists(tablename, boto_resource=boto_resource):
+        create_rotating_message_table(
             prefix=prefix, delta=delta, date=date,
             read_throughput=message_read_throughput,
             write_throughput=message_write_throughput,
+            boto_resource=boto_resource
         )
+        return tablename
     else:
-        return g_dynamodb.Table(tablename)
+        return tablename
 
 
 def create_router_table(tablename="router", read_throughput=5,
-                        write_throughput=5):
+                        write_throughput=5,
+                        boto_resource=None):
     # type: (str, int, int) -> Table
     """Create a new router table
 
@@ -233,8 +283,7 @@ def create_router_table(tablename="router", read_throughput=5,
     cost of additional queries during GC to locate expired users.
 
     """
-
-    table = g_dynamodb.create_table(
+    table = boto_resource.create_table(
         TableName=tablename,
         KeySchema=[
             {
@@ -293,20 +342,22 @@ def create_router_table(tablename="router", read_throughput=5,
     return table
 
 
-def _drop_table(tablename):
+def _drop_table(tablename, boto_resource):
     try:
-        g_client.delete_table(TableName=tablename)
+        boto_resource.meta.client.delete_table(TableName=tablename)
     except ClientError:  # pragma nocover
         pass
 
 
-def _make_table(table_func, tablename, read_throughput, write_throughput):
-    # type: (Callable[[str, int, int], Table], str, int, int) -> Table
+def _make_table(table_func, tablename, read_throughput, write_throughput,
+                boto_resource):
+    # type: (Callable[[str, int, int, ServiceResource]], str, int, int, ServiceResource) -> Table  # noqa
     """Private common function to make a table with a table func"""
-    if not table_exists(tablename):
-        return table_func(tablename, read_throughput, write_throughput)
+    if not table_exists(tablename, boto_resource):
+        return table_func(tablename, read_throughput, write_throughput,
+                          boto_resource)
     else:
-        return g_dynamodb.Table(tablename)
+        return boto_resource.Table(tablename)
 
 
 def _expiry(ttl):
@@ -314,7 +365,7 @@ def _expiry(ttl):
 
 
 def get_router_table(tablename="router", read_throughput=5,
-                     write_throughput=5):
+                     write_throughput=5, boto_resource=None):
     # type: (str, int, int) -> Table
     """Get the main router table object
 
@@ -323,10 +374,11 @@ def get_router_table(tablename="router", read_throughput=5,
 
     """
     return _make_table(create_router_table, tablename, read_throughput,
-                       write_throughput)
+                       write_throughput, boto_resource=boto_resource)
 
 
-def preflight_check(message, router, uaid="deadbeef00000000deadbeef00000000"):
+def preflight_check(message, router, uaid="deadbeef00000000deadbeef00000000",
+                    boto_resource=None):
     # type: (Message, Router, str) -> None
     """Performs a pre-flight check of the router/message to ensure
     appropriate permissions for operation.
@@ -337,7 +389,7 @@ def preflight_check(message, router, uaid="deadbeef00000000deadbeef00000000"):
     # Verify tables are ready for use if they just got created
     ready = False
     while not ready:
-        tbl_status = [x.table_status() for x in [message, router]]
+        tbl_status = [x.table_status()for x in [message, router]]
         ready = all([status == "ACTIVE" for status in tbl_status])
         if not ready:
             time.sleep(1)
@@ -355,7 +407,6 @@ def preflight_check(message, router, uaid="deadbeef00000000deadbeef00000000"):
         message_id=message_id,
         ttl=60,
     )
-
     # Store a notification, fetch it, delete it
     message.store_message(notif)
     assert message.delete_message(notif)
@@ -431,45 +482,48 @@ def generate_last_connect_values(date):
             yield int(val)
 
 
-def list_tables(client=g_client):
-    """Return a list of the names of all DynamoDB tables."""
-    start_table = None
-    while True:
-        if start_table:  # pragma nocover
-            result = client.list_tables(ExclusiveStartTableName=start_table)
-        else:
-            result = client.list_tables()
-        for table in result.get('TableNames', []):
-            yield table
-        start_table = result.get('LastEvaluatedTableName', None)
-        if not start_table:
-            break
-
-
-def table_exists(tablename, client=None):
+def table_exists(tablename, boto_resource=None, resource_pool=None):
+    # type: (str, ServiceResource, BotoResources) -> bool
     """Determine if the specified Table exists"""
-    if not client:
-        client = g_client
-    return tablename in list_tables(client)
+    release = False
+    if not boto_resource:
+        boto_resource = resource_pool.fetch()
+        release = True
+    try:
+        return boto_resource.Table(tablename).table_status in [
+            'CREATING', 'UPDATING', 'ACTIVE']
+    except ClientError:
+        return False
+    finally:
+        if release:
+            resource_pool.release(boto_resource)
 
 
 class Message(object):
     """Create a Message table abstraction on top of a DynamoDB Table object"""
-    def __init__(self, table, metrics, max_ttl=MAX_EXPIRY):
-        # type: (Table, IMetrics) -> None
+    def __init__(self, tablename, metrics=None, resource_pool=None,
+                 max_ttl=MAX_EXPIRY):
+        # type: (str, IMetrics, BotoResources, int) -> None
         """Create a new Message object
 
-        :param table: :class:`Table` object.
-        :param metrics: Metrics object that implements the
-                        :class:`autopush.metrics.IMetrics` interface.
+        :param tablename: name of the table.
+        :param metrics: unused
+        :param resource_pool: BotoResources pool for thread
 
         """
-        self.table = table
-        self.metrics = metrics
+        self.tablename = tablename
         self._max_ttl = max_ttl
+        self._resources = resource_pool
+
+    def table(self, tablename=None):
+        if not tablename:
+            tablename = self.tablename
+        with self._resources as boto_resource:
+            table = boto_resource.Table(tablename)
+        return table
 
     def table_status(self):
-        return self.table.table_status
+        return self.table().table_status
 
     @track_provisioned
     def register_channel(self, uaid, channel_id, ttl=None):
@@ -482,7 +536,7 @@ class Message(object):
             ":channel_id": set([normalize_id(channel_id)]),
             ":expiry": _expiry(ttl)
         }
-        self.table.update_item(
+        self.table().update_item(
             Key={
                 'uaid': hasher(uaid),
                 'chidmessageid': ' ',
@@ -500,7 +554,7 @@ class Message(object):
         chid = normalize_id(channel_id)
         expr_values = {":channel_id": set([chid])}
 
-        response = self.table.update_item(
+        response = self.table().update_item(
             Key={
                 'uaid': hasher(uaid),
                 'chidmessageid': ' ',
@@ -520,13 +574,13 @@ class Message(object):
 
     @track_provisioned
     def all_channels(self, uaid):
-        # type: (str) -> Tuple[bool, Set[str]]
+        # type: (str, ServiceResource) -> Tuple[bool, Set[str]]
         """Retrieve a list of all channels for a given uaid"""
 
         # Note: This only returns the chids associated with the UAID.
         # Functions that call store_message() would be required to
         # update that list as well using register_channel()
-        result = self.table.get_item(
+        result = self.table().get_item(
             Key={
                 'uaid': hasher(uaid),
                 'chidmessageid': ' ',
@@ -543,7 +597,7 @@ class Message(object):
     def save_channels(self, uaid, channels):
         # type: (str, Set[str]) -> None
         """Save out a set of channels"""
-        self.table.put_item(
+        self.table().put_item(
             Item={
                 'uaid': hasher(uaid),
                 'chidmessageid': ' ',
@@ -569,7 +623,7 @@ class Message(object):
         )
         if notification.data:
             item['data'] = notification.data
-        self.table.put_item(Item=item)
+        self.table().put_item(Item=item)
 
     @track_provisioned
     def delete_message(self, notification):
@@ -577,7 +631,7 @@ class Message(object):
         """Deletes a specific message"""
         if notification.update_id:
             try:
-                self.table.delete_item(
+                self.table().delete_item(
                     Key={
                         'uaid': hasher(notification.uaid.hex),
                         'chidmessageid': notification.sort_key
@@ -591,7 +645,7 @@ class Message(object):
             except ClientError:
                 return False
         else:
-            self.table.delete_item(
+            self.table().delete_item(
                 Key={
                     'uaid': hasher(notification.uaid.hex),
                     'chidmessageid': notification.sort_key,
@@ -612,16 +666,16 @@ class Message(object):
 
         """
         # Eagerly fetches all results in the result set.
-        response = self.table.query(
+        response = self.table().query(
             KeyConditionExpression=(Key("uaid").eq(hasher(uaid.hex))
                                     & Key('chidmessageid').lt('02')),
             ConsistentRead=True,
             Limit=limit,
         )
         results = list(response['Items'])
-        # First extract the position if applicable, slightly higher than 01:
-        # to ensure we don't load any 01 remainders that didn't get deleted
-        # yet
+        # First extract the position if applicable, slightly higher than
+        # 01: to ensure we don't load any 01 remainders that didn't get
+        # deleted yet
         last_position = None
         if results:
             # Ensure we return an int, as boto2 can return Decimals
@@ -657,7 +711,7 @@ class Message(object):
         else:
             sortkey = "01;"
 
-        response = self.table.query(
+        response = self.table().query(
             KeyConditionExpression=(Key('uaid').eq(hasher(uaid.hex))
                                     & Key('chidmessageid').gt(sortkey)),
             ConsistentRead=True,
@@ -680,7 +734,7 @@ class Message(object):
         expr = "SET current_timestamp=:timestamp, expiry=:expiry"
         expr_values = {":timestamp": timestamp,
                        ":expiry": _expiry(self._max_ttl)}
-        self.table.update_item(
+        self.table().update_item(
             Key={
                 "uaid": hasher(uaid.hex),
                 "chidmessageid": " "
@@ -693,24 +747,37 @@ class Message(object):
 
 class Router(object):
     """Create a Router table abstraction on top of a DynamoDB Table object"""
-    def __init__(self, table, metrics, max_ttl=MAX_EXPIRY):
-        # type: (Table, IMetrics) -> None
+    def __init__(self, conf, metrics, resource_pool, max_ttl=MAX_EXPIRY):
+        # type: (dict, IMetrics, BotoResources, int) -> None
         """Create a new Router object
 
         :param table: :class:`Table` object.
         :param metrics: Metrics object that implements the
                         :class:`autopush.metrics.IMetrics` interface.
+        :param resource_pool: Pool of :class:`autopush.db.BotoResources`
 
         """
-        self.table = table
+        self.conf = conf
         self.metrics = metrics
         self._max_ttl = max_ttl
+        self._cached_table = None
+        self._resources = resource_pool or BotoResources()
+        self._resource = None
+
+    def table(self):
+        with self._resources as boto_resource:
+            if self.conf:
+                table = get_router_table(boto_resource=boto_resource,
+                                         **asdict(self.conf))
+            else:
+                table = get_router_table(boto_resource=boto_resource)
+        return table
 
     def table_status(self):
-        return self.table.table_status
+        return self.table().table_status
 
     def get_uaid(self, uaid):
-        # type: (str) -> Item
+        # type: (str, ServiceResource) -> Item
         """Get the database record for the UAID
 
         :raises:
@@ -720,7 +787,7 @@ class Router(object):
 
         """
         try:
-            item = self.table.get_item(
+            item = self.table().get_item(
                 Key={
                     'uaid': hasher(uaid)
                 },
@@ -761,7 +828,8 @@ class Router(object):
         db_key = {"uaid": hasher(data["uaid"])}
         del data["uaid"]
         if "router_type" not in data or "connected_at" not in data:
-            # Not specifying these values will generate an exception in AWS.
+            # Not specifying these values will generate an exception in
+            # AWS.
             raise AutopushException("data is missing router_type "
                                     "or connected_at")
         # Generate our update expression
@@ -775,7 +843,7 @@ class Router(object):
                 attribute_not_exists(node_id) or
                 (connected_at < :connected_at)
             )"""
-            result = self.table.update_item(
+            result = self.table().update_item(
                 Key=db_key,
                 UpdateExpression=expr,
                 ConditionExpression=cond,
@@ -786,7 +854,7 @@ class Router(object):
                 r = {}
                 for key, value in result["Attributes"].items():
                     try:
-                        r[key] = self.table._dynamizer.decode(value)
+                        r[key] = self.table()._dynamizer.decode(value)
                     except (TypeError, AttributeError):  # pragma: nocover
                         # Included for safety as moto has occasionally made
                         # this not work
@@ -794,8 +862,8 @@ class Router(object):
                 result = r
             return (True, result)
         except ClientError as ex:
-            # ClientErrors are generated by a factory, and while they have a
-            # class, it's dynamically generated.
+            # ClientErrors are generated by a factory, and while they have
+            # a class, it's dynamically generated.
             if ex.response['Error']['Code'] == \
                     'ConditionalCheckFailedException':
                 return (False, {})
@@ -808,7 +876,7 @@ class Router(object):
         # The following hack ensures that only uaids that exist and are
         # deleted return true.
         try:
-            item = self.table.get_item(
+            item = self.table().get_item(
                 Key={
                     'uaid': hasher(uaid)
                 },
@@ -818,13 +886,14 @@ class Router(object):
                 return False
         except ClientError:
             pass
-        result = self.table.delete_item(Key={'uaid': hasher(uaid)})
+        result = self.table().delete_item(
+            Key={'uaid': hasher(uaid)})
         return result['ResponseMetadata']['HTTPStatusCode'] == 200
 
     def delete_uaids(self, uaids):
         # type: (List[str]) -> None
         """Issue a batch delete call for the given uaids"""
-        with self.table.batch_writer() as batch:
+        with self.table().batch_writer() as batch:
             for uaid in uaids:
                 batch.delete_item(Key={'uaid': uaid})
 
@@ -850,6 +919,7 @@ class Router(object):
             quickly as possible.
 
         :param months_ago: how many months ago since the last connect
+        :param boto_resource: ServiceResource for thread
 
         :returns: Iterable of how many deletes were run
 
@@ -858,7 +928,7 @@ class Router(object):
 
         batched = []
         for hash_key in generate_last_connect_values(prior_date):
-            response = self.table.query(
+            response = self.table().query(
                 KeyConditionExpression=Key("last_connect").eq(hash_key),
                 IndexName="AccessIndex",
             )
@@ -878,7 +948,7 @@ class Router(object):
 
     @track_provisioned
     def _update_last_connect(self, uaid, last_connect):
-        self.table.update_item(
+        self.table().update_item(
             Key={"uaid": hasher(uaid)},
             UpdateExpression="SET last_connect=:last_connect",
             ExpressionAttributeValues={":last_connect": last_connect}
@@ -902,7 +972,7 @@ class Router(object):
                        ":last_connect": generate_last_connect(),
                        ":expiry": _expiry(self._max_ttl),
                        }
-        self.table.update_item(
+        self.table().update_item(
             Key=db_key,
             UpdateExpression=expr,
             ExpressionAttributeValues=expr_values,
@@ -929,7 +999,7 @@ class Router(object):
 
         try:
             cond = "(node_id = :node) and (connected_at = :conn)"
-            self.table.put_item(
+            self.table().put_item(
                 Item=item,
                 ConditionExpression=cond,
                 ExpressionAttributeValues={
@@ -952,15 +1022,15 @@ class DatabaseManager(object):
 
     _router_conf = attrib()   # type: DDBTableConfig
     _message_conf = attrib()  # type: DDBTableConfig
-
-    metrics = attrib()  # type: IMetrics
+    metrics = attrib()        # type: IMetrics
+    _resources = attrib()     # type: BotoResources
 
     router = attrib(default=None)                   # type: Optional[Router]
-    message_tables = attrib(default=Factory(dict))  # type: Dict[str, Message]
+    message_tables = attrib(default=Factory(list))  # type: List[str]
     current_msg_month = attrib(init=False)          # type: Optional[str]
     current_month = attrib(init=False)              # type: Optional[int]
+    _message = attrib(default=None)                 # type: Optional[Message]
     # for testing:
-    client = attrib(default=g_client)                    # type: Optional[Any]
 
     def __attrs_post_init__(self):
         """Initialize sane defaults"""
@@ -970,16 +1040,23 @@ class DatabaseManager(object):
             self._message_conf.tablename,
             date=today
         )
+        if not self._resources:
+            self._resources = BotoResources()
 
     @classmethod
-    def from_config(cls, conf, **kwargs):
-        # type: (AutopushConfig, **Any) -> DatabaseManager
+    def from_config(cls, conf, resource_pool=None, **kwargs):
+        # type: (AutopushConfig, BotoResources, **Any) -> DatabaseManager
         """Create a DatabaseManager from the given config"""
         metrics = autopush.metrics.from_config(conf)
+        if not resource_pool:
+            resource_pool = BotoResources(conf={
+                'endpoint_url': conf.aws_ddb_endpoint
+            })
         return cls(
             router_conf=conf.router_table,
             message_conf=conf.message_table,
             metrics=metrics,
+            resources=resource_pool,
             **kwargs
         )
 
@@ -988,14 +1065,18 @@ class DatabaseManager(object):
         """Setup metrics, message tables and perform preflight_check"""
         self.metrics.start()
         self.setup_tables()
-        preflight_check(self.message, self.router, preflight_uaid)
+        with self._resources as ddb_resource:
+            preflight_check(self.message, self.router, preflight_uaid,
+                            boto_resource=ddb_resource)
 
     def setup_tables(self):
         """Lookup or create the database tables"""
         self.router = Router(
-            get_router_table(**asdict(self._router_conf)),
-            self.metrics
+            conf=self._router_conf,
+            metrics=self.metrics,
+            resource_pool=self._resources,
         )
+        self.router.table()
         # Used to determine whether a connection is out of date with current
         # db objects. There are three noteworty cases:
         # 1 "Last Month" the table requires a rollover.
@@ -1005,18 +1086,24 @@ class DatabaseManager(object):
         #   table is present before the switchover is the main reason for this,
         #   just in case some nodes do switch sooner.
         self.create_initial_message_tables()
+        self._message = Message(self.current_msg_month,
+                                self.metrics,
+                                resource_pool=self.resources)
 
     @property
     def message(self):
         # type: () -> Message
         """Property that access the current message table"""
-        return self.message_tables[self.current_msg_month]
+        if not self._message or isinstance(self._message, Attribute):
+            self._message = self.message_table(self.current_msg_month)
+        return self._message
 
-    @message.setter
-    def message(self, value):
-        # type: (Message) -> None
-        """Setter to set the current message table"""
-        self.message_tables[self.current_msg_month] = value
+    @property
+    def resources(self):
+        return self._resources
+
+    def message_table(self, tablename):
+        return Message(tablename, self.metrics, resource_pool=self.resources)
 
     def _tomorrow(self):
         # type: () -> datetime.date
@@ -1031,32 +1118,32 @@ class DatabaseManager(object):
         """
         mconf = self._message_conf
         today = datetime.date.today()
-        last_month = get_rotating_message_table(
-            prefix=mconf.tablename,
-            delta=-1,
-            message_read_throughput=mconf.read_throughput,
-            message_write_throughput=mconf.write_throughput
-        )
-        this_month = get_rotating_message_table(
-            prefix=mconf.tablename,
-            message_read_throughput=mconf.read_throughput,
-            message_write_throughput=mconf.write_throughput
-        )
-        self.current_month = today.month
-        self.current_msg_month = this_month.table_name
-        self.message_tables = {
-            last_month.table_name: Message(last_month, self.metrics),
-            this_month.table_name: Message(this_month, self.metrics)
-        }
-        if self._tomorrow().month != today.month:
-            next_month = get_rotating_message_table(
+        with self.resources as boto_resource:
+            last_month = get_rotating_message_tablename(
                 prefix=mconf.tablename,
-                delta=1,
+                delta=-1,
                 message_read_throughput=mconf.read_throughput,
-                message_write_throughput=mconf.write_throughput
+                message_write_throughput=mconf.write_throughput,
+                boto_resource=boto_resource,
             )
-            self.message_tables[next_month.table_name] = Message(
-                next_month, self.metrics)
+            this_month = get_rotating_message_tablename(
+                prefix=mconf.tablename,
+                message_read_throughput=mconf.read_throughput,
+                message_write_throughput=mconf.write_throughput,
+                boto_resource=boto_resource,
+            )
+            self.current_month = today.month
+            self.current_msg_month = this_month
+            self.message_tables = [last_month, this_month]
+            if self._tomorrow().month != today.month:
+                next_month = get_rotating_message_tablename(
+                    prefix=mconf.tablename,
+                    delta=1,
+                    message_read_throughput=mconf.read_throughput,
+                    message_write_throughput=mconf.write_throughput,
+                    boto_resource=boto_resource,
+                )
+                self.message_tables.append(next_month)
 
     @inlineCallbacks
     def update_rotating_tables(self):
@@ -1072,26 +1159,26 @@ class DatabaseManager(object):
         today = datetime.date.today()
         tomorrow = self._tomorrow()
         if ((tomorrow.month != today.month) and
-                sorted(self.message_tables.keys())[-1] != tomorrow.month):
-            next_month = yield deferToThread(
-                get_rotating_message_table,
-                prefix=mconf.tablename,
-                delta=0,
-                date=tomorrow,
-                message_read_throughput=mconf.read_throughput,
-                message_write_throughput=mconf.write_throughput
-            )
-            self.message_tables[next_month.table_name] = Message(
-                next_month, self.metrics)
-
+                sorted(self.message_tables)[-1] != tomorrow.month):
+            with self.resources as boto_resource:
+                next_month = yield deferToThread(
+                    get_rotating_message_tablename,
+                    prefix=mconf.tablename,
+                    delta=0,
+                    date=tomorrow,
+                    message_read_throughput=mconf.read_throughput,
+                    message_write_throughput=mconf.write_throughput,
+                    boto_resource=boto_resource
+                )
+            self.message_tables.append(next_month)
         if today.month == self.current_month:
             # No change in month, we're fine.
             returnValue(False)
 
-        # Get tables for the new month, and verify they exist before we try to
-        # switch over
+        # Get tables for the new month, and verify they exist before we
+        # try to switch over
         message_table = yield deferToThread(
-            get_rotating_message_table,
+            get_rotating_message_tablename,
             prefix=mconf.tablename,
             message_read_throughput=mconf.read_throughput,
             message_write_throughput=mconf.write_throughput
@@ -1099,7 +1186,5 @@ class DatabaseManager(object):
 
         # Both tables found, safe to switch-over
         self.current_month = today.month
-        self.current_msg_month = message_table.table_name
-        self.message_tables[self.current_msg_month] = Message(
-            message_table, self.metrics)
+        self.current_msg_month = message_table
         returnValue(True)

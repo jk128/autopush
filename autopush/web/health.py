@@ -33,14 +33,15 @@ class HealthHandler(BaseWebHandler):
         )
 
         dl = DeferredList([
-            self._check_table(self.db.router.table),
-            self._check_table(self.db.message.table, "storage")
+            self._check_table(self.db.router.table()),
+            self._check_table(self.db.message.table(), "storage"),
         ])
         dl.addBoth(self._finish_response)
 
     def _check_table(self, table, name_over=None):
         """Checks the tables known about in DynamoDB"""
-        d = deferToThread(table_exists, table.table_name, self.db.client)
+        d = deferToThread(table_exists, table.table_name,
+                          resource_pool=self.db.resources)
         d.addCallback(self._check_success, name_over or table.table_name)
         d.addErrback(self._check_error, name_over or table.table_name)
         return d
@@ -61,7 +62,7 @@ class HealthHandler(BaseWebHandler):
         if failure.check(InternalServerError):
             cause["error"] = "Server error"
         elif failure.check(MissingTableException):
-            cause["error"] = failure.getErrorMessage()
+            cause["error"] = failure.value.message
         else:
             cause["error"] = "Internal error"
 

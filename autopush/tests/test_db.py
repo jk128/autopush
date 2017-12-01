@@ -11,7 +11,7 @@ from mock import Mock
 import pytest
 
 from autopush.db import (
-    get_rotating_message_table,
+    get_rotating_message_tablename,
     get_router_table,
     create_router_table,
     preflight_check,
@@ -21,11 +21,14 @@ from autopush.db import (
     generate_last_connect,
     make_rotating_tablename,
     _drop_table,
-    _make_table)
+    _make_table,
+    )
 from autopush.exceptions import AutopushException
 from autopush.metrics import SinkMetrics
 from autopush.utils import WebPushNotification
 
+# nose fails to import sessions correctly.
+import autopush.tests
 
 dummy_uaid = str(uuid.UUID("abad1dea00000000aabbccdd00000000"))
 dummy_chid = str(uuid.UUID("deadbeef00000000decafbad00000000"))
@@ -44,17 +47,29 @@ def make_webpush_notification(uaid, chid, ttl=100):
 
 class DbUtilsTest(unittest.TestCase):
     def test_make_table(self):
+        fake_resource = Mock()
         fake_func = Mock()
         fake_table = "DoesNotExist_{}".format(uuid.uuid4())
 
-        _make_table(fake_func, fake_table, 5, 10)
-        assert fake_func.call_args[0] == (fake_table, 5, 10)
+        _make_table(fake_func, fake_table, 5, 10, boto_resource=fake_resource)
+        assert fake_func.call_args[0] == (fake_table, 5, 10, fake_resource)
 
 
 class DbCheckTestCase(unittest.TestCase):
+    def setUp(cls):
+        cls.resource = autopush.tests.boto_resources.fetch()
+
+    def tearDown(cls):
+        autopush.tests.boto_resources.release(cls.resource)
+
     def test_preflight_check_fail(self):
-        router = Router(get_router_table(), SinkMetrics())
-        message = Message(get_rotating_message_table(), SinkMetrics())
+        router = Router(get_router_table(boto_resource=self.resource),
+                        SinkMetrics(),
+                        resource_pool=autopush.tests.boto_resources)
+        message = Message(get_rotating_message_tablename(
+            boto_resource=self.resource),
+            SinkMetrics(),
+            resource_pool=autopush.tests.boto_resources)
 
         def raise_exc(*args, **kwargs):  # pragma: no cover
             raise Exception("Oops")
@@ -63,14 +78,18 @@ class DbCheckTestCase(unittest.TestCase):
         router.clear_node.side_effect = raise_exc
 
         with pytest.raises(Exception):
-            preflight_check(message, router)
+            preflight_check(message, router, self.resource)
 
     def test_preflight_check(self):
-        router = Router(get_router_table(), SinkMetrics())
-        message = Message(get_rotating_message_table(), SinkMetrics())
+        router = Router({}, SinkMetrics(),
+                        resource_pool=autopush.tests.boto_resources)
+        message = Message(get_rotating_message_tablename(
+            boto_resource=self.resource),
+            SinkMetrics(),
+            resource_pool=autopush.tests.boto_resources)
 
         pf_uaid = "deadbeef00000000deadbeef01010101"
-        preflight_check(message, router, pf_uaid)
+        preflight_check(message, router, pf_uaid, self.resource)
         # now check that the database reports no entries.
         _, notifs = message.fetch_messages(uuid.UUID(pf_uaid))
         assert len(notifs) == 0
@@ -78,14 +97,18 @@ class DbCheckTestCase(unittest.TestCase):
             router.get_uaid(pf_uaid)
 
     def test_preflight_check_wait(self):
-        router = Router(get_router_table(), SinkMetrics())
-        message = Message(get_rotating_message_table(), SinkMetrics())
+        router = Router({}, SinkMetrics(),
+                        resource_pool=autopush.tests.boto_resources)
+        message = Message(get_rotating_message_tablename(
+            boto_resource=self.resource),
+            SinkMetrics(),
+            resource_pool=autopush.tests.boto_resources)
 
         values = ["PENDING", "ACTIVE"]
         message.table_status = Mock(side_effect=values)
 
         pf_uaid = "deadbeef00000000deadbeef01010101"
-        preflight_check(message, router, pf_uaid)
+        preflight_check(message, router, pf_uaid, self.resource)
         # now check that the database reports no entries.
         _, notifs = message.fetch_messages(uuid.UUID(pf_uaid))
         assert len(notifs) == 0
@@ -126,21 +149,25 @@ class DbCheckTestCase(unittest.TestCase):
 
 class MessageTestCase(unittest.TestCase):
     def setUp(self):
-        table = get_rotating_message_table()
+        self.resource = autopush.tests.boto_resources.fetch()
+        table = get_rotating_message_tablename(boto_resource=self.resource)
         self.real_table = table
         self.uaid = str(uuid.uuid4())
 
     def tearDown(self):
+        autopush.tests.boto_resources.release(self.resource)
         pass
 
     def test_register(self):
         chid = str(uuid.uuid4())
-        m = get_rotating_message_table()
-        message = Message(m, SinkMetrics())
-        message.register_channel(self.uaid, chid)
 
+        m = get_rotating_message_tablename(boto_resource=self.resource)
+        message = Message(m, SinkMetrics(),
+                          resource_pool=autopush.tests.boto_resources)
+        message.register_channel(self.uaid, chid)
+        lm = self.resource.Table(m)
         # Verify it's in the db
-        response = m.query(
+        response = lm.query(
             KeyConditions={
                 'uaid': {
                     'AttributeValueList': [self.uaid],
@@ -157,12 +184,15 @@ class MessageTestCase(unittest.TestCase):
 
     def test_unregister(self):
         chid = str(uuid.uuid4())
-        m = get_rotating_message_table()
-        message = Message(m, SinkMetrics())
+        m = get_rotating_message_tablename(boto_resource=self.resource)
+        message = Message(m, SinkMetrics(),
+                          resource_pool=autopush.tests.boto_resources)
         message.register_channel(self.uaid, chid)
 
         # Verify its in the db
-        response = m.query(
+        lm = self.resource.Table(m)
+        # Verify it's in the db
+        response = lm.query(
             KeyConditions={
                 'uaid': {
                     'AttributeValueList': [self.uaid],
@@ -182,7 +212,7 @@ class MessageTestCase(unittest.TestCase):
         message.unregister_channel(self.uaid, chid)
 
         # Verify its not in the db
-        response = m.query(
+        response = lm.query(
             KeyConditions={
                 'uaid': {
                     'AttributeValueList': [self.uaid],
@@ -200,18 +230,21 @@ class MessageTestCase(unittest.TestCase):
         assert results[0].get("chids") is None
 
         # Test for the very unlikely case that there's no 'chid'
-        m.update_item = Mock(return_value={
+        mtable = Mock()
+        mtable.update_item = Mock(return_value={
             'Attributes': {'uaid': self.uaid},
             'ResponseMetaData': {}
         })
+        message.table = Mock(return_value=mtable)
         r = message.unregister_channel(self.uaid, dummy_chid)
         assert r is False
 
     def test_all_channels(self):
         chid = str(uuid.uuid4())
         chid2 = str(uuid.uuid4())
-        m = get_rotating_message_table()
-        message = Message(m, SinkMetrics())
+        m = get_rotating_message_tablename(boto_resource=self.resource)
+        message = Message(m, SinkMetrics(),
+                          resource_pool=autopush.tests.boto_resources)
         message.register_channel(self.uaid, chid)
         message.register_channel(self.uaid, chid2)
 
@@ -225,24 +258,27 @@ class MessageTestCase(unittest.TestCase):
         assert chid in chans
 
     def test_all_channels_fail(self):
-        m = get_rotating_message_table()
-        message = Message(m, SinkMetrics())
 
-        message.table.get_item = Mock()
-        message.table.get_item.return_value = {
+        m = get_rotating_message_tablename(boto_resource=self.resource)
+        message = Message(m, SinkMetrics(),
+                          resource_pool=autopush.tests.boto_resources)
+
+        mtable = Mock()
+        mtable.get_item.return_value = {
             "ResponseMetadata": {
                 "HTTPStatusCode": 400
             },
         }
-
+        message.table = Mock(return_value=mtable)
         res = message.all_channels(self.uaid)
         assert res == (False, set([]))
 
     def test_save_channels(self):
         chid = str(uuid.uuid4())
         chid2 = str(uuid.uuid4())
-        m = get_rotating_message_table()
-        message = Message(m, SinkMetrics())
+        m = get_rotating_message_tablename(boto_resource=self.resource)
+        message = Message(m, SinkMetrics(),
+                          resource_pool=autopush.tests.boto_resources)
         message.register_channel(self.uaid, chid)
         message.register_channel(self.uaid, chid2)
 
@@ -253,16 +289,18 @@ class MessageTestCase(unittest.TestCase):
         assert chans == new_chans
 
     def test_all_channels_no_uaid(self):
-        m = get_rotating_message_table()
-        message = Message(m, SinkMetrics())
+        m = get_rotating_message_tablename(boto_resource=self.resource)
+        message = Message(m, SinkMetrics(),
+                          resource_pool=autopush.tests.boto_resources)
         exists, chans = message.all_channels(dummy_uaid)
         assert chans == set([])
 
     def test_message_storage(self):
         chid = str(uuid.uuid4())
         chid2 = str(uuid.uuid4())
-        m = get_rotating_message_table()
-        message = Message(m, SinkMetrics())
+        m = get_rotating_message_tablename(boto_resource=self.resource)
+        message = Message(m, SinkMetrics(),
+                          resource_pool=autopush.tests.boto_resources)
         message.register_channel(self.uaid, chid)
         message.register_channel(self.uaid, chid2)
 
@@ -283,8 +321,9 @@ class MessageTestCase(unittest.TestCase):
         notif2 = make_webpush_notification(self.uaid, chid)
         notif3 = make_webpush_notification(self.uaid, chid2)
         notif2.message_id = notif1.message_id
-        m = get_rotating_message_table()
-        message = Message(m, SinkMetrics())
+        m = get_rotating_message_tablename(boto_resource=self.resource)
+        message = Message(m, SinkMetrics(),
+                          resource_pool=autopush.tests.boto_resources)
         message.register_channel(self.uaid, chid)
         message.register_channel(self.uaid, chid2)
 
@@ -292,20 +331,23 @@ class MessageTestCase(unittest.TestCase):
         message.store_message(notif2)
         message.store_message(notif3)
 
-        all_messages = list(message.fetch_messages(uuid.UUID(self.uaid)))
+        all_messages = list(message.fetch_messages(
+            uuid.UUID(self.uaid)))
         assert len(all_messages) == 2
 
     def test_message_delete_fail_condition(self):
         notif = make_webpush_notification(dummy_uaid, dummy_chid)
         notif.message_id = notif.update_id = dummy_uaid
-        m = get_rotating_message_table()
-        message = Message(m, SinkMetrics())
+        m = get_rotating_message_tablename(boto_resource=self.resource)
+        message = Message(m, SinkMetrics(),
+                          resource_pool=autopush.tests.boto_resources)
 
         def raise_condition(*args, **kwargs):
             raise ClientError({}, 'delete_item')
 
-        message.table = Mock()
-        message.table.delete_item.side_effect = raise_condition
+        m_de = Mock()
+        m_de.delete_item = Mock(side_effect=raise_condition)
+        message.table = Mock(return_value=m_de)
         result = message.delete_message(notif)
         assert result is False
 
@@ -314,22 +356,21 @@ class MessageTestCase(unittest.TestCase):
         future = (datetime.today() + timedelta(days=32)).date()
         tbl_name = make_rotating_tablename(prefix, date=future)
 
-        m = get_rotating_message_table(prefix=prefix, date=future)
-        assert m.table_name == tbl_name
+        m = get_rotating_message_tablename(prefix=prefix, date=future,
+                                           boto_resource=self.resource)
+        assert m == tbl_name
         # Clean up the temp table.
-        _drop_table(tbl_name)
+        _drop_table(tbl_name, boto_resource=self.resource)
 
 
 class RouterTestCase(unittest.TestCase):
     @classmethod
-    def setup_class(self):
-        table = get_router_table()
-        self.real_table = table
-        self.real_connection = table.meta.client
+    def setUpClass(cls):
+        cls.boto_resource = autopush.tests.boto_resources.fetch()
 
     @classmethod
-    def teardown_class(self):
-        self.real_table.meta.client = self.real_connection
+    def tearDownClass(cls):
+        autopush.tests.boto_resources.release(cls.boto_resource)
 
     def _create_minimal_record(self):
         data = {
@@ -342,10 +383,10 @@ class RouterTestCase(unittest.TestCase):
 
     def test_drop_old_users(self):
         # First create a bunch of users
-        r = get_router_table()
-        router = Router(r, SinkMetrics())
+        router = Router({}, SinkMetrics(),
+                        resource_pool=autopush.tests.boto_resources)
         # Purge any existing users from previous runs.
-        router.drop_old_users(0)
+        router.drop_old_users(months_ago=0)
         for _ in range(0, 53):
             router.register_user(self._create_minimal_record())
 
@@ -354,57 +395,61 @@ class RouterTestCase(unittest.TestCase):
 
     def test_custom_tablename(self):
         db_name = "router_%s" % uuid.uuid4()
-        assert not table_exists(db_name)
-        create_router_table(db_name)
-        assert table_exists(db_name)
+        assert not table_exists(db_name, boto_resource=self.boto_resource)
+        create_router_table(db_name, boto_resource=self.boto_resource)
+        assert table_exists(db_name, boto_resource=self.boto_resource)
         # Clean up the temp table.
-        _drop_table(db_name)
+        _drop_table(db_name, boto_resource=self.boto_resource)
 
     def test_provisioning(self):
         db_name = "router_%s" % uuid.uuid4()
 
-        r = create_router_table(db_name, 3, 17)
+        r = create_router_table(db_name, 3, 17,
+                                boto_resource=self.boto_resource)
         assert r.provisioned_throughput.get('ReadCapacityUnits') == 3
         assert r.provisioned_throughput.get('WriteCapacityUnits') == 17
 
     def test_no_uaid_found(self):
         uaid = str(uuid.uuid4())
-        r = get_router_table()
-        router = Router(r, SinkMetrics())
+        router = Router({}, SinkMetrics(),
+                        resource_pool=autopush.tests.boto_resources)
         with pytest.raises(ItemNotFound):
             router.get_uaid(uaid)
 
     def test_uaid_provision_failed(self):
-        r = get_router_table()
-        router = Router(r, SinkMetrics())
+        router = Router({}, SinkMetrics(),
+                        resource_pool=autopush.tests.boto_resources)
         router.table = Mock()
 
         def raise_condition(*args, **kwargs):
-            import autopush.db
-            raise autopush.db.g_client.exceptions.ClientError(
+            raise ClientError(
                 {'Error': {'Code': 'ProvisionedThroughputExceededException'}},
                 'mock_update_item'
             )
 
-        router.table.get_item.side_effect = raise_condition
+        mm = Mock()
+        mm.get_item = Mock(side_effect=raise_condition)
+        router.table = Mock(return_value=mm)
         with pytest.raises(ClientError) as ex:
             router.get_uaid(uaid="asdf")
         assert (ex.value.response['Error']['Code'] ==
                 "ProvisionedThroughputExceededException")
 
     def test_register_user_provision_failed(self):
-        r = get_router_table()
-        router = Router(r, SinkMetrics())
-        router.table.meta.client = Mock()
+        router = Router({}, SinkMetrics(),
+                        resource_pool=autopush.tests.boto_resources)
+        mm = Mock()
+        mm.client = Mock()
+
+        router.table = Mock(return_value=mm)
 
         def raise_condition(*args, **kwargs):
-            import autopush.db
-            raise autopush.db.g_client.exceptions.ClientError(
+            raise ClientError(
                 {'Error': {'Code': 'ProvisionedThroughputExceededException'}},
                 'mock_update_item'
             )
 
-        router.table.update_item = Mock(side_effect=raise_condition)
+        mm.update_item = Mock(side_effect=raise_condition)
         with pytest.raises(ClientError) as ex:
             router.register_user(dict(uaid=dummy_uaid, node_id="me",
                                       connected_at=1234,
@@ -413,35 +458,36 @@ class RouterTestCase(unittest.TestCase):
                 "ProvisionedThroughputExceededException")
 
     def test_register_user_condition_failed(self):
-        r = get_router_table()
-        router = Router(r, SinkMetrics())
-        router.table.meta.client = Mock()
+        router = Router({}, SinkMetrics(),
+                        resource_pool=autopush.tests.boto_resources)
+        router.table().meta.client = Mock()
 
         def raise_error(*args, **kwargs):
-            import autopush.db
-            raise autopush.db.g_client.exceptions.ClientError(
+            raise ClientError(
                 {'Error': {'Code': 'ConditionalCheckFailedException'}},
                 'mock_update_item'
             )
-
-        router.table.update_item = Mock(side_effect=raise_error)
+        mm = Mock()
+        mm.update_item = Mock(side_effect=raise_error)
+        router.table = Mock(return_value=mm)
         res = router.register_user(dict(uaid=dummy_uaid, node_id="me",
                                         connected_at=1234,
                                         router_type="webpush"))
         assert res == (False, {})
 
     def test_clear_node_provision_failed(self):
-        r = get_router_table()
-        router = Router(r, SinkMetrics())
+        router = Router({}, SinkMetrics(),
+                        resource_pool=autopush.tests.boto_resources)
 
         def raise_condition(*args, **kwargs):
-            import autopush.db
-            raise autopush.db.g_client.exceptions.ClientError(
+            raise ClientError(
                 {'Error': {'Code': 'ProvisionedThroughputExceededException'}},
                 'mock_update_item'
             )
 
-        router.table.put_item = Mock(side_effect=raise_condition)
+        mm = Mock()
+        mm.put_item = Mock(side_effect=raise_condition)
+        router.table = Mock(return_value=mm)
         with pytest.raises(ClientError) as ex:
             router.clear_node(dict(uaid=dummy_uaid,
                                    connected_at="1234",
@@ -451,32 +497,33 @@ class RouterTestCase(unittest.TestCase):
                 "ProvisionedThroughputExceededException")
 
     def test_clear_node_condition_failed(self):
-        r = get_router_table()
-        router = Router(r, SinkMetrics())
+        router = Router({}, SinkMetrics(),
+                        resource_pool=autopush.tests.boto_resources)
 
         def raise_error(*args, **kwargs):
-            import autopush.db
-            raise autopush.db.g_client.exceptions.ClientError(
+            raise ClientError(
                 {'Error': {'Code': 'ConditionalCheckFailedException'}},
                 'mock_put_item'
             )
 
-        router.table.put_item = Mock(side_effect=raise_error)
+        router.table().put_item = Mock(
+            side_effect=raise_error)
         res = router.clear_node(dict(uaid=dummy_uaid,
                                      connected_at="1234",
                                      node_id="asdf",
                                      router_type="webpush"))
+
         assert res is False
 
     def test_incomplete_uaid(self):
         # Older records may be incomplete. We can't inject them using normal
         # methods.
         uaid = str(uuid.uuid4())
-        r = get_router_table()
-        router = Router(r, SinkMetrics())
-        router.table.get_item = Mock()
-        router.drop_user = Mock()
-        router.table.get_item.return_value = {
+        router = Router({}, SinkMetrics(),
+                        resource_pool=autopush.tests.boto_resources)
+        mm = Mock()
+        mm.get_item = Mock()
+        mm.get_item.return_value = {
             "ResponseMetadata": {
                 "HTTPStatusCode": 200
             },
@@ -484,6 +531,13 @@ class RouterTestCase(unittest.TestCase):
                 "uaid": uuid.uuid4().hex
             }
         }
+        mm.delete_item.return_value = {
+            "ResponseMetadata": {
+                "HTTPStatusCode": 200
+            },
+        }
+        router.table = Mock(return_value=mm)
+        router.drop_user = Mock()
         try:
             router.register_user(dict(uaid=uaid))
         except AutopushException:
@@ -494,24 +548,28 @@ class RouterTestCase(unittest.TestCase):
 
     def test_failed_uaid(self):
         uaid = str(uuid.uuid4())
-        r = get_router_table()
-        router = Router(r, SinkMetrics())
-        router.table.get_item = Mock()
-        router.drop_user = Mock()
-        router.table.get_item.return_value = {
+        router = Router({}, SinkMetrics(),
+                        resource_pool=autopush.tests.boto_resources)
+        mm = Mock()
+        mm.get_item = Mock()
+        mm.get_item.return_value = {
             "ResponseMetadata": {
                 "HTTPStatusCode": 400
             },
         }
+        router.table = Mock(return_value=mm)
+        router.drop_user = Mock()
         with pytest.raises(ItemNotFound):
             router.get_uaid(uaid)
 
     def test_save_new(self):
-        r = get_router_table()
-        router = Router(r, SinkMetrics())
+        router = Router({}, SinkMetrics(),
+                        resource_pool=autopush.tests.boto_resources)
         # Sadly, moto currently does not return an empty value like boto
         # when not updating data.
-        router.table.update_item = Mock(return_value={})
+        mock_update = Mock()
+        mock_update.update_item = Mock(return_value={})
+        router.table = Mock(return_value=mock_update)
         result = router.register_user(dict(uaid=dummy_uaid,
                                            node_id="me",
                                            router_type="webpush",
@@ -519,25 +577,26 @@ class RouterTestCase(unittest.TestCase):
         assert result[0] is True
 
     def test_save_fail(self):
-        r = get_router_table()
-        router = Router(r, SinkMetrics())
+        router = Router({}, SinkMetrics(),
+                        resource_pool=autopush.tests.boto_resources)
 
         def raise_condition(*args, **kwargs):
-            import autopush.db
-            raise autopush.db.g_client.exceptions.ClientError(
+            raise ClientError(
                 {'Error': {'Code': 'ConditionalCheckFailedException'}},
                 'mock_update_item'
             )
 
-        router.table.update_item = Mock(side_effect=raise_condition)
+        mock_update = Mock()
+        mock_update.update_item = Mock(side_effect=raise_condition)
+        router.table = Mock(return_value=mock_update)
         router_data = dict(uaid=dummy_uaid, node_id="asdf", connected_at=1234,
                            router_type="webpush")
         result = router.register_user(router_data)
         assert result == (False, {})
 
     def test_node_clear(self):
-        r = get_router_table()
-        router = Router(r, SinkMetrics())
+        router = Router({}, SinkMetrics(),
+                        resource_pool=autopush.tests.boto_resources)
 
         # Register a node user
         router.register_user(dict(uaid=dummy_uaid, node_id="asdf",
@@ -559,8 +618,8 @@ class RouterTestCase(unittest.TestCase):
         assert user["router_type"] == "webpush"
 
     def test_node_clear_fail(self):
-        r = get_router_table()
-        router = Router(r, SinkMetrics())
+        router = Router({}, SinkMetrics(),
+                        resource_pool=autopush.tests.boto_resources)
 
         def raise_condition(*args, **kwargs):
             raise ClientError(
@@ -568,15 +627,17 @@ class RouterTestCase(unittest.TestCase):
                 'mock_update_item'
             )
 
-        router.table.put_item = Mock(side_effect=raise_condition)
+        mock_put = Mock()
+        mock_put.put_item = Mock(side_effect=raise_condition)
+        router.table = Mock(return_value=mock_put)
         data = dict(uaid=dummy_uaid, node_id="asdf", connected_at=1234)
         result = router.clear_node(data)
         assert result is False
 
     def test_drop_user(self):
         uaid = str(uuid.uuid4())
-        r = get_router_table()
-        router = Router(r, SinkMetrics())
+        router = Router({}, SinkMetrics(),
+                        resource_pool=autopush.tests.boto_resources)
         # Register a node user
         router.register_user(dict(uaid=uaid, node_id="asdf",
                                   router_type="webpush",

@@ -5,6 +5,7 @@ import click
 from autopush.db import (
     get_router_table,
     Router,
+    BotoResources,
 )
 from autopush.metrics import SinkMetrics
 
@@ -18,20 +19,21 @@ from autopush.metrics import SinkMetrics
               help="Seconds to pause between batches.")
 def drop_users(router_table_name, months_ago, batch_size, pause_time):
     router_table = get_router_table(router_table_name)
-    router = Router(router_table, SinkMetrics())
-
+    resources = BotoResources()
+    router = Router(router_table, SinkMetrics(), resource_pool=resources)
     click.echo("Deleting users with a last_connect %s months ago."
                % months_ago)
 
     count = 0
-    for deletes in router.drop_old_users(months_ago):
-        click.echo("")
-        count += deletes
-        if count >= batch_size:
-            click.echo("Deleted %s user records, pausing for %s seconds."
-                       % pause_time)
-            time.sleep(pause_time)
-            count = 0
+    with resources as ddb_resource:
+        for deletes in router.drop_old_users(months_ago, ddb_resource):
+            click.echo("")
+            count += deletes
+            if count >= batch_size:
+                click.echo("Deleted %s user records, pausing for %s seconds."
+                           % pause_time)
+                time.sleep(pause_time)
+                count = 0
     click.echo("Finished old user purge.")
 
 
