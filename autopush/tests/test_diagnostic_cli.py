@@ -57,3 +57,12 @@ class DiagnosticCLITestCase(unittest.TestCase):
             use_files=False,
             resource_pool=autopush.tests.boto_resources)
         mock_message.all_channels.assert_called()
+
+    def test_parser_tuple(self):
+        from autopush.diagnostic_cli import EndpointDiagnosticCLI
+
+        edc = EndpointDiagnosticCLI(
+            ("http://someendpoint",),
+            resource_pool=autopush.tests.boto_resources)
+        assert edc is not None
+        assert edc._endpoint == "http://someendpoint"

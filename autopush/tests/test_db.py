@@ -378,6 +378,7 @@ class RouterTestCase(unittest.TestCase):
             "router_type": "webupsh",
             "last_connect": generate_last_connect(),
             "connected_at": ms_time(),
+            "current_month": datetime.today().month,
         }
         return data
 

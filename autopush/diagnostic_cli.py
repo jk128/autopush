@@ -31,11 +31,11 @@ class EndpointDiagnosticCLI(object):
     def _load_args(self, sysargs, use_files):
         shared_config_files = AutopushMultiService.shared_config_files
         if use_files:
-            config_files = shared_config_files + [  # pragma: nocover
+            config_files = shared_config_files + (  # pragma: nocover
                 '/etc/autopush_endpoint.ini',
                 '~/.autopush_endpoint.ini',
                 '.autopush_endpoint.ini'
-            ]
+            )
         else:
             config_files = []  # pragma: nocover
 
